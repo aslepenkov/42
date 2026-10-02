@@ -1,0 +1,94 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  backend:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_ARTIFACT_REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
+      GCP_CLOUD_RUN_SERVICE: ${{ vars.GCP_CLOUD_RUN_SERVICE }}
+      GCP_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+      FRONTEND_ORIGIN: ${{ vars.FRONTEND_ORIGIN }}
+      REVISION: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Check deployment configuration
+        shell: bash
+        run: |
+          : "${GCP_PROJECT_ID:?Set GCP_PROJECT_ID}"
+          : "${GCP_REGION:?Set GCP_REGION}"
+          : "${GCP_ARTIFACT_REPOSITORY:?Set GCP_ARTIFACT_REPOSITORY}"
+          : "${GCP_CLOUD_RUN_SERVICE:?Set GCP_CLOUD_RUN_SERVICE}"
+          : "${GCP_RUNTIME_SERVICE_ACCOUNT:?Set GCP_RUNTIME_SERVICE_ACCOUNT}"
+          : "${FRONTEND_ORIGIN:?Set FRONTEND_ORIGIN to the Netlify HTTPS origin without a trailing slash}"
+      # TODO(ci-auth): replace the key with Workload Identity Federation.
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker "$GCP_REGION-docker.pkg.dev" --quiet
+      - name: Build and push backend
+        run: |
+          IMAGE="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT_ID/$GCP_ARTIFACT_REPOSITORY/api:$REVISION"
+          docker build --tag "$IMAGE" backend
+          docker push "$IMAGE"
+      # TODO(compute): Cloud Run is the default; revisit only for concrete platform needs.
+      - name: Deploy backend
+        id: deploy
+        run: |
+          IMAGE="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT_ID/$GCP_ARTIFACT_REPOSITORY/api:$REVISION"
+          URL=$(gcloud run deploy "$GCP_CLOUD_RUN_SERVICE" \
+            --image "$IMAGE" --region "$GCP_REGION" --project "$GCP_PROJECT_ID" \
+            --service-account "$GCP_RUNTIME_SERVICE_ACCOUNT" --port 8080 \
+            --set-env-vars "ASPNETCORE_ENVIRONMENT=Production,Cors__AllowedOrigins__0=$FRONTEND_ORIGIN" \
+            --allow-unauthenticated --quiet --format='value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+  frontend:
+    needs: backend
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      VITE_API_BASE_URL: ${{ needs.backend.outputs.url }}
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Check Netlify configuration
+        run: |
+          : "${NETLIFY_AUTH_TOKEN:?Set NETLIFY_AUTH_TOKEN}"
+          : "${NETLIFY_SITE_ID:?Set NETLIFY_SITE_ID}"
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - name: Deploy frontend
+        working-directory: frontend
+        run: npx --yes netlify-cli@27.10.1 deploy --dir=dist --prod --no-build
